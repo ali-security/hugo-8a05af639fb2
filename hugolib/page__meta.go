@@ -422,6 +422,9 @@ func (p *pageState) setMetaPostParams() error {
 		if err := pm.pageConfig.Compile(ext, p.s.Log, p.s.conf.OutputFormats.Config, p.s.conf.MediaTypes.Config); err != nil {
 			return err
 		}
+		if err := p.checkAllowedContent(); err != nil {
+			return err
+		}
 	}
 
 	// Handle the date separately
@@ -683,6 +686,25 @@ params:
 		return err
 	}
 
+	if err := p.checkAllowedContent(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// checkAllowedContent gates the content format against the security policy.
+// The body of a content file is treated as untrusted; text/html is denied by default
+// because Hugo emits it verbatim and that is an XSS sink. This applies
+// to pages emitted by content adapters too -- the adapter is trusted
+// but the data it pulls in may not be.
+func (p *pageState) checkAllowedContent() error {
+	pm := p.m
+	if pm.f != nil && !pm.pageConfig.ContentMediaType.IsZero() {
+		if err := p.s.ExecHelper.Sec().CheckAllowedContent(pm.pageConfig.ContentMediaType.Type); err != nil {
+			return p.wrapError(err)
+		}
+	}
 	return nil
 }
 
