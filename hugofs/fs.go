@@ -242,6 +242,8 @@ func WrapFilesystem(container, content afero.Fs) afero.Fs {
 	return filesystemsWrapper{Fs: container, content: content}
 }
 
+var _ afero.Lstater = (*filesystemsWrapper)(nil)
+
 type filesystemsWrapper struct {
 	afero.Fs
 	content afero.Fs
@@ -251,12 +253,45 @@ func (w filesystemsWrapper) UnwrapFilesystem() afero.Fs {
 	return w.content
 }
 
+func (w filesystemsWrapper) LstatIfPossible(name string) (os.FileInfo, bool, error) {
+	if _, ok := w.Fs.(*afero.ReadOnlyFs); ok {
+		// afero.ReadOnlyFs passes the name unchanged to its source (see NewReadOnlyFs),
+		// so go directly to the source to Lstat through any overlayfs.OverlayFs.
+		return lstatIfPossible(w.content, name)
+	}
+	if lstater, ok := w.Fs.(afero.Lstater); ok {
+		return lstater.LstatIfPossible(name)
+	}
+	fi, err := w.Fs.Stat(name)
+	return fi, false, err
+}
+
 // LstatIfPossible tries to use LstatIfPossible if the filesystem supports it, otherwise it falls back to Stat.
 func LstatIfPossible(fs afero.Fs, name string) (os.FileInfo, error) {
+	fi, _, err := lstatIfPossible(fs, name)
+	return fi, err
+}
+
+func lstatIfPossible(fs afero.Fs, name string) (os.FileInfo, bool, error) {
+	if ofs, ok := fs.(*overlayfs.OverlayFs); ok {
+		return lstatOverlayFs(ofs, name)
+	}
 	if lstater, ok := fs.(afero.Lstater); ok {
-		fi, _, err := lstater.LstatIfPossible(name)
-		return fi, err
+		return lstater.LstatIfPossible(name)
 	}
 	fi, err := fs.Stat(name)
-	return fi, err
+	return fi, false, err
+}
+
+// lstatOverlayFs is LstatIfPossible for an overlayfs.OverlayFs.
+// overlayfs.OverlayFs.LstatIfPossible uses Stat (which follows symlinks) on the
+// overlaid filesystems, so we check them in order using LstatIfPossible.
+func lstatOverlayFs(ofs *overlayfs.OverlayFs, name string) (os.FileInfo, bool, error) {
+	for i := range ofs.NumFilesystems() {
+		fi, ok, err := lstatIfPossible(ofs.Filesystem(i), name)
+		if err == nil || !os.IsNotExist(err) {
+			return fi, ok, err
+		}
+	}
+	return nil, false, os.ErrNotExist
 }
