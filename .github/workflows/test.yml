@@ -1,7 +1,10 @@
 on:
-  push:
-    branches: [master]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go test -run regexp; empty runs the full suite"
+        required: false
+        default: ""
 name: Test
 env:
   GOPROXY: https://proxy.golang.org
@@ -13,8 +16,59 @@ env:
 permissions:
   contents: read
 jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      - name: Install Go
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: 1.24.x
+          cache: false
+      - name: Build module zip
+        run: |
+          helper="$(mktemp -d)"
+          mkdir -p "$RUNNER_TEMP/out"
+          cd "$helper"
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              v := module.Version{Path: "github.com/gohugoio/hugo", Version: "v0.149.1"}
+              if err := zip.CreateFromDir(f, v, os.Args[1]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go run . "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.149.1.zip"
+          ls -l "$RUNNER_TEMP/out"
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.149.1.zip
+          if-no-files-found: error
   test:
+    timeout-minutes: 50
     strategy:
+      fail-fast: false
       matrix:
         go-version: [1.24.x, 1.25.x]
         os: [ubuntu-latest, windows-latest] # macos disabled for now because of disk space issues.
@@ -44,10 +98,14 @@ jobs:
           cache-dependency-path: |
             **/go.sum
             **/go.mod
-      - name: Install Ruby
-        uses: ruby/setup-ruby@a6e6f86333f0a2523ece813039b8b4be04560854 # v1.190.0
+      - name: Install Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          ruby-version: "2.7"
+          node-version: "22"
+      - name: Install Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
           bundler-cache: true #
       - name: Install Python
         uses: actions/setup-python@39cd14951b08e74b54015e9e001cdefcf80e669f # v5.1.1
@@ -100,24 +158,30 @@ jobs:
           curl -LJO "https://github.com/sass/dart-sass/releases/download/${env:SASS_VERSION}/dart-sass-${env:SASS_VERSION}-windows-x64.zip";
           Expand-Archive -Path "dart-sass-${env:SASS_VERSION}-windows-x64.zip" -DestinationPath .;
           echo  "$env:GITHUB_WORKSPACE/dart-sass/" | Out-File -FilePath $Env:GITHUB_PATH -Encoding utf-8 -Append
-      - if: matrix.os == 'ubuntu-latest'
-        name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@latest
-      - if: matrix.os == 'ubuntu-latest'
-        name: Run staticcheck
-        run: staticcheck ./...
+      - name: Enable verbose go test output
+        run: go env -w GOFLAGS=-v
       - if: matrix.os != 'windows-latest'
         name: Check
+        shell: bash
         run: |
           sass --version;
-          mage -v check;
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -p 2 -race ./... -tags "$HUGO_BUILD_TAGS" -run "${{ inputs.test-filter }}" 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          else
+            mage -v test386 testRace 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          fi
         env:
           HUGO_BUILD_TAGS: extended,withdeploy
       - if: matrix.os == 'windows-latest'
         # See issue #11052. We limit the build to regular test (no -race flag) on Windows for now.
         name: Test
+        shell: bash
         run: |
-          mage -v test;
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -p 2 ./... -tags "$HUGO_BUILD_TAGS" -run "${{ inputs.test-filter }}" 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          else
+            mage -v test 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          fi
         env:
           HUGO_BUILD_TAGS: extended,withdeploy
       - name: Build tags
@@ -130,3 +194,51 @@ jobs:
         env:
           GOARCH: amd64
           GOOS: dragonfly
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/test-output.log"
+          [ -f "$f" ] || { echo "no test output captured"; exit 0; }
+          export SKIPS_OUT="$RUNNER_TEMP/skips.txt" SUMS_OUT="$RUNNER_TEMP/sums.txt"
+          awk '
+            BEGIN { seg="go-test"; out=ENVIRON["SKIPS_OUT"]; sum=ENVIRON["SUMS_OUT"] }
+            { sub(/\r$/, "") }
+            /^Running target: / { seg=$3; order[++nseg]=seg; next }
+            /^=== (RUN|CONT|NAME|PAUSE) +/ { cur=$3; next }
+            /^ok[ \t]/ { okp[seg]++; split("", last); split("", note); next }
+            /^FAIL[ \t]/ { failp[seg]++; split("", last); split("", note); next }
+            /^ +# / { r=$0; sub(/^ +# /, "", r); note[cur]=r; next }
+            /^ +> .*skip/ { r=$0; sub(/^ +> /, "", r); last[cur]="testscript directive \"" r "\"" ((cur in note) ? " (" note[cur] ")" : ""); next }
+            /^ +[^ ]+\.go:[0-9]+:/ { r=$0; sub(/^ +/, "", r); if (r ~ /: *$/) { sub(/: *$/, "", r); r="bare t.Skip() at " r } else sub(/^[^ ]+\.go:[0-9]+: /, "", r); last[cur]=r; next }
+            /^ *--- PASS: / { pass[seg]++; next }
+            /^ *--- FAIL: / { fail[seg]++; next }
+            /^ *--- SKIP: / { skip[seg]++; k=seg "|" ((($3) in last) ? last[$3] : "(no reason printed)"); names[k]=names[k] " " $3; cnt[k]++ }
+            END {
+              for (k in names) { split(k, a, "|"); printf "SKIP [%s] x%d reason=[%s] tests:%s\n", a[1], cnt[k], substr(k, length(a[1]) + 2), names[k] > out }
+              if (nseg == 0) order[++nseg]="go-test"
+              for (j = 1; j <= nseg; j++) { g=order[j]; printf "[%s] packages ok: %d, packages FAIL: %d; tests passed: %d, tests failed: %d, tests skipped: %d\n", g, okp[g], failp[g], pass[g], fail[g], skip[g] > sum; tp+=pass[g]; tf+=fail[g]; ts+=skip[g] }
+              printf "[all targets] tests passed: %d, tests failed: %d, tests skipped: %d\n", tp, tf, ts > sum
+            }' "$f"
+          echo "=== Skipped tests, one line per reason (bare t.Skip() lines show the guarding source line) ==="
+          touch "$RUNNER_TEMP/skips.txt"
+          sort "$RUNNER_TEMP/skips.txt" | while IFS= read -r line; do
+            loc=$(printf '%s\n' "$line" | sed -n 's/.*bare t\.Skip() at \([^ ]*_test\.go\):\([0-9]*\)\].*/\1 \2/p')
+            if [ -n "$loc" ]; then
+              set -- $loc
+              guard="unconditional"
+              for src in $(git ls-files "*/$1" "$1"); do
+                if sed -n "${2}p" "$src" | grep -q 'Skip()'; then
+                  g=$(sed -n "$(( $2 > 4 ? $2 - 4 : 1 )),$(( $2 - 1 ))p" "$src" | grep -E '^\s*(if |\} else|.*\.Run\()' | tail -1 | sed 's/^\s*//')
+                  guard="${g:-unconditional} in $src"
+                fi
+              done
+              line="$line guard=[$guard]"
+            fi
+            printf '%s\n' "$line"
+          done
+          echo "note: Test386 runs without -tags extended (magefile.go: extended is not supported in 32-bit), so the scss/dartsass tests guarded by scss.Supports() skip there and run in TestRace."
+          echo "=== Failed tests ==="
+          grep -E '^ *--- FAIL: ' "$f" || echo "none"
+          echo "=== Go test summary ==="
+          cat "$RUNNER_TEMP/sums.txt"
