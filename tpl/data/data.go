@@ -45,7 +45,17 @@ func New(deps *deps.Deps) *Namespace {
 		deps:         deps,
 		cacheGetCSV:  deps.ResourceSpec.FileCaches.GetCSVCache(),
 		cacheGetJSON: deps.ResourceSpec.FileCaches.GetJSONCache(),
-		client:       http.DefaultClient,
+		client: &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if err := deps.ExecHelper.Sec().CheckAllowedHTTPURL(req.URL.String()); err != nil {
+					return err
+				}
+				if len(via) >= 10 {
+					return errors.New("stopped after 10 redirects")
+				}
+				return nil
+			},
+		},
 	}
 }
 
