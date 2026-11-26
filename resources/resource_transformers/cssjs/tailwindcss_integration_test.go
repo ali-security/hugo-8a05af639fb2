@@ -14,11 +14,16 @@
 package cssjs_test
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/bep/logg"
 	qt "github.com/frankban/quicktest"
 	"github.com/gohugoio/hugo/htesting"
+	"github.com/gohugoio/hugo/hugofs"
 	"github.com/gohugoio/hugo/hugolib"
 )
 
@@ -70,6 +75,77 @@ CSS: {{ $css.Content | safeCSS }}|
 		}).Build()
 
 	b.AssertFileContent("public/index.html", "/*! tailwindcss v4.")
+}
+
+// Node tools are run under Node's permission model, so a TailwindCSS plugin
+// from an untrusted site can neither read nor write files outside the project.
+func TestTailwindCSSNodePermissionsOutsideProject(t *testing.T) {
+	if !htesting.IsCI() {
+		t.Skip("Skip long running test when running locally")
+	}
+
+	c := qt.New(t)
+	tempDir, clean, err := htesting.CreateTempDir(hugofs.Os, "hugo-integration-test")
+	c.Assert(err, qt.IsNil)
+	c.Cleanup(clean)
+
+	site := filepath.Join(tempDir, "site")
+	outside := filepath.Join(tempDir, "outside")
+	secretFilename := filepath.Join(outside, "secret.txt")
+	pwnedFilename := filepath.Join(outside, "pwned.txt")
+	c.Assert(os.MkdirAll(site, 0o755), qt.IsNil)
+	c.Assert(os.MkdirAll(outside, 0o755), qt.IsNil)
+	c.Assert(os.WriteFile(secretFilename, []byte("secret"), 0o644), qt.IsNil)
+
+	files := `
+-- hugo.toml --
+disableKinds = ['taxonomy', 'term', 'page', 'section', 'rss', 'sitemap']
+-- package.json --
+{
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.7",
+    "tailwindcss": "^4.1.7"
+  }
+}
+-- evil-plugin.js --
+const fs = require('fs');
+function attempt(name, fn) {
+	try {
+		fn();
+		console.error(name + ': ALLOWED');
+	} catch (err) {
+		console.error(name + ': ' + err.code);
+	}
+}
+attempt('READ_OUTSIDE', () => fs.readFileSync(SECRET_FILENAME, 'utf8'));
+attempt('WRITE_OUTSIDE', () => fs.writeFileSync(PWNED_FILENAME, 'pwned'));
+module.exports = function () {};
+-- assets/css/styles.css --
+@import "tailwindcss";
+@plugin "./evil-plugin.js";
+-- layouts/home.html --
+{{ $css := resources.Get "css/styles.css" | css.TailwindCSS }}
+CSS: {{ $css.Content | safeCSS }}|
+`
+	files = strings.NewReplacer(
+		"SECRET_FILENAME", strconv.Quote(secretFilename),
+		"PWNED_FILENAME", strconv.Quote(pwnedFilename),
+	).Replace(files)
+
+	b := hugolib.Test(c, files, hugolib.TestOptOsFs(), hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+		cfg.WorkingDir = site
+		cfg.NeedsNpmInstall = true
+		cfg.LogLevel = logg.LevelInfo
+	}))
+
+	b.AssertFileContent("public/index.html", "/*! tailwindcss v4.")
+	b.AssertLogContains(
+		"READ_OUTSIDE: ERR_ACCESS_DENIED",
+		"WRITE_OUTSIDE: ERR_ACCESS_DENIED",
+		"! ALLOWED",
+	)
+	_, err = os.Stat(pwnedFilename)
+	c.Assert(os.IsNotExist(err), qt.IsTrue)
 }
 
 func TestTailwindCSSNoInlineImportsIssue13719(t *testing.T) {

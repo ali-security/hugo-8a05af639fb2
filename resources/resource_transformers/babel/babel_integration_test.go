@@ -14,10 +14,16 @@
 package babel_test
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/bep/logg"
+	qt "github.com/frankban/quicktest"
 	"github.com/gohugoio/hugo/htesting"
+	"github.com/gohugoio/hugo/hugofs"
 	"github.com/gohugoio/hugo/hugolib"
 )
 
@@ -51,7 +57,7 @@ module.exports = {
 disablekinds = ['taxonomy', 'term', 'page']
 [security]
 	[security.exec]
-	allow = ['^npx$', '^babel$']
+	allow = ['^node$', '^babel$']
 -- layouts/index.html --
 {{ $options := dict "noComments" true }}
 {{ $transpiled := resources.Get "js/main.js" | babel -}}
@@ -90,4 +96,87 @@ Transpiled3: {{ $transpiled.Permalink }}
 	b.AssertFileContent("public/js/main2.js.map", `{"version":3,`)
 	b.AssertFileContent("public/index.html", `
 //# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozL`)
+}
+
+// Node tools are run under Node's permission model, so a babel.config.js
+// from an untrusted site can neither read nor write files outside the
+// project, nor spawn child processes.
+func TestTransformBabelNodePermissionsOutsideProject(t *testing.T) {
+	if !htesting.IsCI() {
+		t.Skip("Skip long running test when running locally")
+	}
+
+	c := qt.New(t)
+	tempDir, clean, err := htesting.CreateTempDir(hugofs.Os, "hugo-integration-test")
+	c.Assert(err, qt.IsNil)
+	c.Cleanup(clean)
+
+	site := filepath.Join(tempDir, "site")
+	outside := filepath.Join(tempDir, "outside")
+	secretFilename := filepath.Join(outside, "secret.txt")
+	pwnedFilename := filepath.Join(outside, "pwned.txt")
+	c.Assert(os.MkdirAll(site, 0o755), qt.IsNil)
+	c.Assert(os.MkdirAll(outside, 0o755), qt.IsNil)
+	c.Assert(os.WriteFile(secretFilename, []byte("secret"), 0o644), qt.IsNil)
+
+	files := `
+-- assets/js/main.js --
+/* A Car */
+class Car {
+	constructor(brand) {
+	this.carname = brand;
+	}
+}
+-- babel.config.js --
+const fs = require('fs');
+function attempt(name, fn) {
+	try {
+		fn();
+		console.error(name + ': ALLOWED');
+	} catch (err) {
+		console.error(name + ': ' + err.code);
+	}
+}
+attempt('READ_OUTSIDE', () => fs.readFileSync(SECRET_FILENAME, 'utf8'));
+attempt('WRITE_OUTSIDE', () => fs.writeFileSync(PWNED_FILENAME, 'pwned'));
+attempt('CHILD_PROCESS', () => require('child_process').execFileSync(process.execPath, ['--version']));
+module.exports = {};
+-- hugo.toml --
+disableKinds = ['taxonomy', 'term', 'page', 'section', 'rss', 'sitemap']
+[security]
+	[security.exec]
+	allow = ['^node$', '^babel$']
+-- layouts/index.html --
+{{ $transpiled := resources.Get "js/main.js" | babel -}}
+Transpiled: {{ $transpiled.Content | safeJS }}|
+-- package.json --
+{
+	"scripts": {},
+
+	"devDependencies": {
+	"@babel/cli": "7.8.4",
+	"@babel/core": "7.9.0"
+	}
+}
+`
+	files = strings.NewReplacer(
+		"SECRET_FILENAME", strconv.Quote(secretFilename),
+		"PWNED_FILENAME", strconv.Quote(pwnedFilename),
+	).Replace(files)
+
+	b := hugolib.Test(c, files, hugolib.TestOptOsFs(), hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+		cfg.WorkingDir = site
+		cfg.NeedsNpmInstall = true
+		cfg.LogLevel = logg.LevelInfo
+	}))
+
+	b.AssertFileContent("public/index.html", "class Car")
+	b.AssertLogContains(
+		"READ_OUTSIDE: ERR_ACCESS_DENIED",
+		"WRITE_OUTSIDE: ERR_ACCESS_DENIED",
+		"CHILD_PROCESS: ERR_ACCESS_DENIED",
+		"! ALLOWED",
+	)
+	_, err = os.Stat(pwnedFilename)
+	c.Assert(os.IsNotExist(err), qt.IsTrue)
 }
